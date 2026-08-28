@@ -373,6 +373,7 @@ def get_shelf_context(db, location_id: str):
     return {
         "location_id": location_id,
         "fixture": slot["fixture"],
+        "fixture_image": slot["fixture"].lower().replace(" ", "_") + ".png",
         "position_index": idx + 1,
         "fixture_total": len(fixture_rows),
         "left_neighbor": _neighbor(idx - 1),
@@ -528,6 +529,7 @@ def do_scan(req: ScanRequest) -> dict:
                     visual["wrong"] = {
                         "location_id": wrong_ctx["location_id"],
                         "fixture": wrong_ctx["fixture"],
+                        "fixture_image": wrong_ctx["fixture_image"],
                         "position_index": wrong_ctx["position_index"],
                         "fixture_total": wrong_ctx["fixture_total"],
                     }
@@ -573,6 +575,24 @@ def get_current_pdf():
         media_type="application/pdf",
         content_disposition_type="inline",
     )
+
+
+SHELF_IMAGE_DIR = Path(__file__).parent / "demo" / "shelf_images"
+_ALLOWED_SHELF_IMAGES = {"pegboard_5.png", "shelf_4.png", "shelf_3.png", "shelf_2.png", "shelf_1.png"}
+
+
+@app.get("/shelf-images/{filename}")
+def get_shelf_image(filename: str):
+    """Gercek PDF'ten kesilmis, o rafin TAMAMINI gosteren fotograf.
+    Konum vurgulama (kirmizi/yesil ok) frontend'de bu resmin uzerine
+    bindirilir - boylece internetten resim cekmeye gerek kalmadan,
+    magazanin gercek urun fotograflari kullanilir."""
+    if filename not in _ALLOWED_SHELF_IMAGES:
+        raise HTTPException(404, "Resim bulunamadi")
+    path = SHELF_IMAGE_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, "Resim bulunamadi")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/api/planogram")
