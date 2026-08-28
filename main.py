@@ -40,6 +40,9 @@ from seed_data import PLANOGRAM_META, PRODUCTS, SLOTS, PRODUCT_IMAGES
 from pdf_parser import parse_planogram_pdf, diff_planograms
 
 DB_PATH = Path(__file__).parent / "planogram.db"
+CURRENT_PDF_PATH = Path(__file__).parent / "current_planogram.pdf"
+PENDING_PDF_DIR = Path(__file__).parent / "pending_pdfs"
+PENDING_PDF_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Planogram Scan API",
@@ -488,6 +491,21 @@ def scanner_page():
     return FileResponse(Path(__file__).parent / "demo" / "scanner.html")
 
 
+@app.get("/planogram-pdf")
+def get_current_pdf():
+    """Su an aktif olan planogramin ORIJINAL PDF dosyasini dondurur.
+    Telefon tarayicisinda acildiginda, tarayicinin kendi PDF goruntuleyicisi
+    devreye girer (iOS Safari'de bu otomatik olarak pinch-zoom destekler,
+    ekstra kod yazmaya gerek yok)."""
+    if not CURRENT_PDF_PATH.exists():
+        raise HTTPException(404, "Henuz kayitli bir planogram PDF'i yok.")
+    return FileResponse(
+        CURRENT_PDF_PATH,
+        media_type="application/pdf",
+        filename="planogram.pdf",
+    )
+
+
 @app.get("/api/planogram")
 def get_planogram():
     """Tum aktif planogramin duz listesi (fixture, konum, urun)."""
@@ -713,6 +731,10 @@ async def upload_planogram(file: UploadFile = File(...)):
             "date_last_modified": datetime.utcnow().strftime("%Y-%m-%d"),
             "version": f"upload-{pending_id}",
         }
+        # Yuklenen PDF'in kendisini de sakla (onaylanirsa "guncel PDF"
+        # olarak sunulacak, telefonda dogrudan goruntulenebilsin diye)
+        (PENDING_PDF_DIR / f"{pending_id}.pdf").write_bytes(content)
+
         db.execute(
             "INSERT INTO pending_uploads (id, slots_json, meta_json, diff_json, created_at) "
             "VALUES (?,?,?,?,?)",
@@ -740,7 +762,8 @@ class ApplyPlanogramRequest(BaseModel):
 @app.post("/api/admin/apply-planogram")
 def apply_planogram(req: ApplyPlanogramRequest):
     """Daha once yuklenip incelenen (pending) bir planogramin ONAYLANMASI:
-    veritabanini kalici olarak yeni planogramla degistirir."""
+    veritabanini kalici olarak yeni planogramla degistirir, PDF'ini de
+    'guncel planogram PDF'i' olarak kaydeder."""
     with get_db() as db:
         row = db.execute(
             "SELECT * FROM pending_uploads WHERE id=?", (req.pending_id,)
@@ -752,5 +775,10 @@ def apply_planogram(req: ApplyPlanogramRequest):
         new_meta = json.loads(row["meta_json"])
         reseed_from_slots(db, new_slots, new_meta)
         db.execute("DELETE FROM pending_uploads WHERE id=?", (req.pending_id,))
+
+    pending_pdf = PENDING_PDF_DIR / f"{req.pending_id}.pdf"
+    if pending_pdf.exists():
+        CURRENT_PDF_PATH.write_bytes(pending_pdf.read_bytes())
+        pending_pdf.unlink()
 
     return {"status": "applied", "total_locations": len(new_slots), "meta": new_meta}
