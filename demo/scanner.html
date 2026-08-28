@@ -217,90 +217,55 @@ function packageIconSvg() {
   return '<svg viewBox="0 0 24 24" width="60%" height="60%" fill="none" stroke="#565b6b" stroke-width="1.5"><path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>';
 }
 
-// Kutu boyutunu ve araligini, konum sayisina gore 300px'lik guvenli
-// genislige (x=40..340) sigacak sekilde hesaplar. Boylece 15 konumlu
-// bir raf da, 10 konumlu bir raf da tasma olmadan cizilir.
-function calcBoxLayout(total) {
-  const safeWidth = 300;
-  const gap = total > 10 ? 3 : 5;
-  let boxSize = Math.floor((safeWidth - (total - 1) * gap) / total);
-  boxSize = Math.max(10, Math.min(30, boxSize));
-  return { boxSize, gap };
-}
-
-function buildShelfRow(ctx, startX, y, highlightColor, imageUrl) {
-  const { boxSize, gap } = calcBoxLayout(ctx.fixture_total);
-  let s = '';
-  for (let i = 0; i < ctx.fixture_total; i++) {
-    const x = startX + i * (boxSize + gap);
-    const isTarget = (i + 1) === ctx.position_index;
-    const stroke = isTarget ? highlightColor : '#3a3f4d';
-    const sw = isTarget ? 2 : 1;
-    s += `<rect x="${x}" y="${y}" width="${boxSize}" height="${boxSize}" rx="3" fill="#10131a" stroke="${stroke}" stroke-width="${sw}"/>`;
-    if (isTarget && imageUrl) {
-      s += `<image href="${imageUrl}" x="${x + 2}" y="${y + 2}" width="${boxSize - 4}" height="${boxSize - 4}" preserveAspectRatio="xMidYMid slice"/>`;
-    }
-  }
-  const hitX = startX + (ctx.position_index - 1) * (boxSize + gap) + boxSize / 2;
-  return { svg: s, hitX, boxSize };
+// Gercek raf fotografinin (PDF'ten kesilen) uzerine, urun(ler)in konumunu
+// gosteren ok/isaretci(ler) bindirir. markers: [{position_index, color, pinLabel}]
+// Yuzde bazli konumlandirma kullanilir (position_index / fixture_total),
+// boylece resmin gercek piksel genisligi bilinmeden de dogru hizada gosterilir.
+function shelfImageWithMarkers(fixture, fixtureImage, fixtureTotal, markers, caption) {
+  const markerHtml = markers.map(m => {
+    const pct = ((m.position_index - 0.5) / fixtureTotal) * 100;
+    return `
+        <div style="position:absolute; left:${pct}%; bottom:0; top:0; width:2px; background:${m.color}; transform:translateX(-50%);"></div>
+        <div style="position:absolute; left:${pct}%; bottom:-2px; transform:translateX(-50%); width:0; height:0; border-left:7px solid transparent; border-right:7px solid transparent; border-bottom:11px solid ${m.color};"></div>
+        <div style="position:absolute; left:${pct}%; top:2px; transform:translateX(-50%); background:${m.color}; color:#fff; font-size:10px; font-weight:700; padding:1px 5px; border-radius:4px; white-space:nowrap;">#${m.locationId}</div>`;
+  }).join('');
+  return `
+    <div style="position:relative; margin-bottom:4px;">
+      <div style="font-size:12px; color:#8a90a3; margin-bottom:4px;">${fixture}${caption ? ' · ' + caption : ''}</div>
+      <div style="position:relative; border-radius:8px; overflow:hidden; background:#fff;">
+        <img src="${apiUrl('/shelf-images/' + fixtureImage)}" style="width:100%; display:block;" alt="${fixture}" />${markerHtml}
+      </div>
+    </div>`;
 }
 
 function renderShelfStrip(target, wrong) {
-  const startX = 40;
-  let svgInner = '';
-  let h = 0;
+  let html = '';
 
   if (wrong && wrong.fixture !== target.fixture) {
-    const { boxSize: bsWrong } = calcBoxLayout(wrong.fixture_total);
-    svgInner += `<text x="${startX}" y="16" font-size="12" fill="#8a90a3">${wrong.fixture} · şimdi burada</text>`;
-    const rowWrong = buildShelfRow(wrong, startX, 22, '#c0392b', null);
-    svgInner += rowWrong.svg;
-    const row2Y = 22 + bsWrong + 44;
-    svgInner += `<text x="${startX}" y="${row2Y - 8}" font-size="12" fill="#8a90a3">${target.fixture} · gitmesi gereken yer</text>`;
-    const rowTarget = buildShelfRow(target, startX, row2Y, '#1a7f37', target.image_url || null);
-    svgInner += rowTarget.svg;
-    const midY = 22 + bsWrong + 18;
-    svgInner += `<path d="M${rowWrong.hitX} ${22 + bsWrong} L${rowWrong.hitX} ${midY} L${rowTarget.hitX} ${midY} L${rowTarget.hitX} ${row2Y}" fill="none" stroke="#4f8cff" stroke-width="2" marker-end="url(#svgarrow)"/>`;
-    h = row2Y + rowTarget.boxSize + 16;
+    html += shelfImageWithMarkers(wrong.fixture, wrong.fixture_image, wrong.fixture_total,
+      [{ position_index: wrong.position_index, color: '#c0392b', locationId: wrong.location_id }],
+      'şu an burada');
+    html += shelfImageWithMarkers(target.fixture, target.fixture_image, target.fixture_total,
+      [{ position_index: target.position_index, color: '#1a7f37', locationId: target.location_id }],
+      'gitmesi gereken yer');
   } else if (wrong) {
-    const { boxSize, gap } = calcBoxLayout(target.fixture_total);
-    svgInner += `<text x="${startX}" y="16" font-size="12" fill="#8a90a3">${target.fixture}</text>`;
-    let s = '';
-    let wrongX = null, targetX = null;
-    for (let i = 0; i < target.fixture_total; i++) {
-      const x = startX + i * (boxSize + gap);
-      const posNum = i + 1;
-      const isWrong = posNum === wrong.position_index;
-      const isTarget = posNum === target.position_index;
-      let stroke = '#3a3f4d', sw = 1;
-      if (isWrong) { stroke = '#c0392b'; sw = 2; wrongX = x + boxSize / 2; }
-      if (isTarget) { stroke = '#1a7f37'; sw = 2; targetX = x + boxSize / 2; }
-      s += `<rect x="${x}" y="22" width="${boxSize}" height="${boxSize}" rx="3" fill="#10131a" stroke="${stroke}" stroke-width="${sw}"/>`;
-      if (isTarget && target.image_url) {
-        s += `<image href="${target.image_url}" x="${x + 2}" y="24" width="${boxSize - 4}" height="${boxSize - 4}" preserveAspectRatio="xMidYMid slice"/>`;
-      }
-    }
-    svgInner += s;
-    const arrowY = 22 + boxSize + 16;
-    svgInner += `<path d="M${wrongX} ${22 + boxSize} L${wrongX} ${arrowY} L${targetX} ${arrowY} L${targetX} ${22 + boxSize}" fill="none" stroke="#4f8cff" stroke-width="2" marker-end="url(#svgarrow)"/>`;
-    h = 22 + boxSize + 36;
+    html += shelfImageWithMarkers(target.fixture, target.fixture_image, target.fixture_total,
+      [
+        { position_index: wrong.position_index, color: '#c0392b', locationId: wrong.location_id },
+        { position_index: target.position_index, color: '#1a7f37', locationId: target.location_id },
+      ],
+      'kırmızı: yanlış yer, yeşil: doğru yer');
   } else {
-    svgInner += `<text x="${startX}" y="16" font-size="12" fill="#8a90a3">${target.fixture}</text>`;
-    const row = buildShelfRow(target, startX, 22, '#1a7f37', target.image_url || null);
-    svgInner += row.svg;
-    h = 22 + row.boxSize + 16;
+    html += shelfImageWithMarkers(target.fixture, target.fixture_image, target.fixture_total,
+      [{ position_index: target.position_index, color: '#1a7f37', locationId: target.location_id }],
+      'doğru konum');
   }
 
   const legend = wrong
-    ? `<div class="shelf-legend"><span><span class="sw" style="background:#c0392b"></span>yanlış yer</span><span><span class="sw" style="background:#1a7f37"></span>doğru yer</span><span><span class="sw" style="background:#4f8cff"></span>gitmesi gereken yön</span></div>`
+    ? `<div class="shelf-legend"><span><span class="sw" style="background:#c0392b"></span>yanlış yer</span><span><span class="sw" style="background:#1a7f37"></span>doğru yer</span></div>`
     : `<div class="shelf-legend"><span><span class="sw" style="background:#1a7f37"></span>doğru konum</span></div>`;
 
-  return `<div class="shelf-svg-wrap">
-    <svg viewBox="0 0 380 ${h}" width="100%" height="${h}" style="display:block;" xmlns="http://www.w3.org/2000/svg">
-      <defs><marker id="svgarrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
-      ${svgInner}
-    </svg>
-  </div>${legend}`;
+  return `<div class="shelf-svg-wrap">${html}</div>${legend}`;
 }
 
 function neighborCard(n, tagLabel, isTarget) {
