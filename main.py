@@ -25,17 +25,19 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from seed_data import PLANOGRAM_META, PRODUCTS, SLOTS, PRODUCT_IMAGES
+from pdf_parser import parse_planogram_pdf, diff_planograms
 
 DB_PATH = Path(__file__).parent / "planogram.db"
 
@@ -127,8 +129,28 @@ def init_db(reset: bool = False):
 
             CREATE INDEX IF NOT EXISTS idx_products_norm ON products(upc_norm);
             CREATE INDEX IF NOT EXISTS idx_scanlog_session ON scan_log(session_id);
+
+            CREATE TABLE IF NOT EXISTS planogram_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_uploads (
+                id TEXT PRIMARY KEY,
+                slots_json TEXT,
+                meta_json TEXT,
+                diff_json TEXT,
+                created_at TEXT
+            );
             """
         )
+
+        meta_seeded = db.execute("SELECT COUNT(*) c FROM planogram_meta").fetchone()["c"]
+        if meta_seeded == 0:
+            for k, v in PLANOGRAM_META.items():
+                db.execute(
+                    "INSERT OR IGNORE INTO planogram_meta (key, value) VALUES (?,?)", (k, str(v))
+                )
 
         seeded = db.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
         if seeded == 0:
@@ -147,6 +169,65 @@ def init_db(reset: bool = False):
                     "INSERT OR IGNORE INTO planogram_slots (location_id, upc, active) VALUES (?,?,1)",
                     (s["location_id"], s["upc"]),
                 )
+
+
+def get_current_meta(db) -> dict:
+    rows = db.execute("SELECT key, value FROM planogram_meta").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def get_current_slots_flat(db) -> list:
+    """Su anki aktif planogramin duz listesini (diff icin) dondurur."""
+    rows = db.execute(
+        """SELECT ps.location_id, p.upc, p.name, l.fixture
+           FROM planogram_slots ps
+           JOIN locations l ON l.location_id = ps.location_id
+           LEFT JOIN products p ON p.upc = ps.upc
+           WHERE ps.active = 1"""
+    ).fetchall()
+    return [dict(r) for r in rows if r["upc"]]
+
+
+def reseed_from_slots(db, new_slots: list, meta: dict):
+    """Veritabanini TAMAMEN yeni bir konum listesiyle degistirir.
+    Yeni bir PDF onaylandiginda kullanilir. Eski scan_log / audit_sessions
+    gecmisi korunur, sadece urun/konum/planogram_slots tablolari
+    yeni veriyle degistirilir."""
+    db.execute("DELETE FROM planogram_slots")
+    db.execute("DELETE FROM locations")
+    db.execute("DELETE FROM products")
+
+    seen = set()
+    for s in new_slots:
+        if s["upc"] not in seen:
+            seen.add(s["upc"])
+            db.execute(
+                "INSERT OR IGNORE INTO products (upc, upc_norm, uin, name, size) VALUES (?,?,?,?,?)",
+                (s["upc"], normalize_code(s["upc"]), s.get("uin"), s["name"], s.get("size")),
+            )
+    for s in new_slots:
+        db.execute(
+            "INSERT OR IGNORE INTO locations "
+            "(location_id, fixture, position, facing_wide, facing_high) VALUES (?,?,?,?,?)",
+            (
+                s["location_id"],
+                s["fixture"],
+                s.get("position"),
+                s.get("facing_wide", 1),
+                s.get("facing_high", 1),
+            ),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO planogram_slots (location_id, upc, active) VALUES (?,?,1)",
+            (s["location_id"], s["upc"]),
+        )
+
+    for k, v in meta.items():
+        db.execute(
+            "INSERT INTO planogram_meta (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (k, str(v)),
+        )
 
 
 init_db()
@@ -389,9 +470,11 @@ def do_scan(req: ScanRequest) -> dict:
 
 @app.get("/")
 def root():
+    with get_db() as db:
+        meta = get_current_meta(db)
     return {
         "service": "Planogram Scan API",
-        "planogram": PLANOGRAM_META,
+        "planogram": meta,
         "docs": "/docs",
         "scanner": "/scanner",
     }
@@ -409,6 +492,7 @@ def scanner_page():
 def get_planogram():
     """Tum aktif planogramin duz listesi (fixture, konum, urun)."""
     with get_db() as db:
+        meta = get_current_meta(db)
         rows = db.execute(
             """SELECT ps.location_id, ps.active, l.fixture, l.position,
                       l.facing_wide, l.facing_high, p.upc, p.name, p.size
@@ -418,7 +502,7 @@ def get_planogram():
                ORDER BY CAST(ps.location_id AS INTEGER)"""
         ).fetchall()
     return {
-        "meta": PLANOGRAM_META,
+        "meta": meta,
         "slots": [dict(r) for r in rows],
     }
 
@@ -448,12 +532,14 @@ def scan(req: ScanRequest):
 def audit_start(req: AuditStartRequest):
     session_id = uuid.uuid4().hex[:12]
     with get_db() as db:
+        meta = get_current_meta(db)
+        version = meta.get("version", "unknown")
         db.execute(
             "INSERT INTO audit_sessions (session_id, store_id, started_at, planogram_version) "
             "VALUES (?,?,?,?)",
-            (session_id, req.store_id, datetime.utcnow().isoformat(), PLANOGRAM_META["version"]),
+            (session_id, req.store_id, datetime.utcnow().isoformat(), version),
         )
-    return {"session_id": session_id, "planogram_version": PLANOGRAM_META["version"]}
+    return {"session_id": session_id, "planogram_version": version}
 
 
 @app.post("/api/audit/{session_id}/scan")
@@ -587,3 +673,84 @@ def admin_reset():
     """Gelistirme/test amacli: veritabanini seed_data.py'daki verilerle sifirdan kurar."""
     init_db(reset=True)
     return {"status": "reset_ok"}
+
+
+# ---------------------------------------------------------------------------
+# Planogram guncelleme (yeni PDF yukleme + karsilastirma + onaylama)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/upload-planogram")
+async def upload_planogram(file: UploadFile = File(...)):
+    """Yeni bir planogram PDF'i yukler, otomatik olarak konum listesini
+    cikarir ve MEVCUT aktif planogramla karsilastirir. Hicbir sey
+    DEGISTIRMEZ - sadece fark raporu doner. Kullanici raporu onaylarsa
+    /api/admin/apply-planogram cagrilir."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Sadece PDF dosyasi yuklenebilir.")
+
+    content = await file.read()
+    try:
+        parsed = parse_planogram_pdf(content)
+    except Exception as e:
+        raise HTTPException(400, f"PDF okunamadi: {e}")
+
+    if not parsed["slots"]:
+        raise HTTPException(
+            400,
+            "PDF'ten hicbir konum verisi cikarilamadi. Dosyanin Murphy USA / "
+            "QuickChek planogram sablonuna uygun oldugundan emin olun.",
+        )
+
+    with get_db() as db:
+        old_slots = get_current_slots_flat(db)
+        diff = diff_planograms(old_slots, parsed["slots"])
+
+        pending_id = uuid.uuid4().hex[:10]
+        new_meta = {
+            "name": parsed.get("pog_id") or "Guncellenmis Planogram",
+            "pog_id": parsed.get("pog_id") or "",
+            "date_live": parsed.get("date_live") or "",
+            "date_last_modified": datetime.utcnow().strftime("%Y-%m-%d"),
+            "version": f"upload-{pending_id}",
+        }
+        db.execute(
+            "INSERT INTO pending_uploads (id, slots_json, meta_json, diff_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (
+                pending_id,
+                json.dumps(parsed["slots"]),
+                json.dumps(new_meta),
+                json.dumps(diff),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+
+    return {
+        "pending_id": pending_id,
+        "new_total_locations": len(parsed["slots"]),
+        "old_total_locations": len(old_slots),
+        "diff": diff,
+    }
+
+
+class ApplyPlanogramRequest(BaseModel):
+    pending_id: str
+
+
+@app.post("/api/admin/apply-planogram")
+def apply_planogram(req: ApplyPlanogramRequest):
+    """Daha once yuklenip incelenen (pending) bir planogramin ONAYLANMASI:
+    veritabanini kalici olarak yeni planogramla degistirir."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM pending_uploads WHERE id=?", (req.pending_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Bekleyen yukleme bulunamadi (suresi gecmis olabilir).")
+
+        new_slots = json.loads(row["slots_json"])
+        new_meta = json.loads(row["meta_json"])
+        reseed_from_slots(db, new_slots, new_meta)
+        db.execute("DELETE FROM pending_uploads WHERE id=?", (req.pending_id,))
+
+    return {"status": "applied", "total_locations": len(new_slots), "meta": new_meta}
