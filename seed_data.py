@@ -126,3 +126,12 @@ for s in SLOTS:
 # Ileride bir urun planogramdan kaldirilirsa buraya eklenip
 # planogram_slots.active = 0 yapilabilir; API bunu otomatik islemek icin hazir.
 REMOVED_PRODUCTS = []
+
+# Urun fotograflari (opsiyonel). UPC -> resim URL'si veya /images/xxx.jpg gibi
+# yerel bir dosya yolu. Bos birakilirsa uygulama otomatik olarak generic bir
+# paket ikonu gosterir. Magaza kendi cektigi urun fotograflarini buraya
+# ekleyebilir, mevcut sistemin geri kalanini degistirmeye gerek yok.
+PRODUCT_IMAGES = {
+    # "4400000680": "https://ornek-adres.com/oreo-mini.jpg",
+}
+
